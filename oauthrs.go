@@ -65,6 +65,8 @@ func New(cfg Config) (*Verifier, error) {
 		return nil, errors.New("oauthrs: an issuer is required")
 	case cfg.Audience == "":
 		return nil, errors.New("oauthrs: an audience is required")
+	case cfg.Introspection != nil && cfg.Introspection.TokenPrefix == "":
+		return nil, errors.New("oauthrs: introspection needs a token prefix")
 	}
 	if cfg.ClockSkew <= 0 {
 		cfg.ClockSkew = defaultClockSkew
@@ -92,10 +94,13 @@ func (v *Verifier) Verify(ctx context.Context, bearer string) (*Token, error) {
 		return nil, invalid("empty or too long")
 	case strings.Count(bearer, ".") == 2:
 		return v.verifyJWT(ctx, bearer)
-	case v.cfg.Introspection != nil:
-		return v.introspect(ctx, bearer)
+	case v.cfg.Introspection == nil:
+		return nil, invalid("opaque token without introspection")
+	// SECURITY: an opaque token without the issuer's prefix is the app's own credential, such as an API key, and never leaves the app.
+	case !strings.HasPrefix(bearer, v.cfg.Introspection.TokenPrefix):
+		return nil, invalid("opaque token without the issuer's prefix")
 	}
-	return nil, invalid("opaque token without introspection")
+	return v.introspect(ctx, bearer)
 }
 
 type accessClaims struct {
