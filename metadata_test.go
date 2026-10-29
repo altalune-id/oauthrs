@@ -56,14 +56,31 @@ func TestMetadataHandler(t *testing.T) {
 func TestParseProtectedResource(t *testing.T) {
 	pr, err := oauthrs.ParseProtectedResource([]byte(`{"resource":"https://notes.example/mcp","authorization_servers":["https://id.example/p/notes"],"x":1}`))
 	require.NoError(t, err)
-	assert.Equal(t, oauthrs.ProtectedResource{Resource: "https://notes.example/mcp", AuthorizationServers: []string{"https://id.example/p/notes"}}, pr)
+	assert.Equal(t, oauthrs.ProtectedResource{
+		Resource: "https://notes.example/mcp", AuthorizationServers: []string{"https://id.example/p/notes"}, Extra: map[string]any{"x": float64(1)},
+	}, pr)
 
 	pr, err = oauthrs.ParseProtectedResource([]byte(`{"Resource":"https://evil.example","AUTHORIZATION_SERVERS":["https://evil.example"]}`))
 	require.NoError(t, err)
-	assert.Equal(t, oauthrs.ProtectedResource{}, pr, "only the exact RFC 9728 keys count, never a case-folded match")
+	assert.Empty(t, pr.Resource, "only the exact RFC 9728 keys count, never a case-folded match")
+	assert.Empty(t, pr.AuthorizationServers, "only the exact RFC 9728 keys count, never a case-folded match")
 
 	for _, bad := range []string{`[]`, `"x"`, `{"resource":1}`, `{"authorization_servers":"x"}`, `not json`} {
 		_, err := oauthrs.ParseProtectedResource([]byte(bad))
 		assert.Error(t, err, bad)
 	}
+}
+
+func TestMetadataExtraMembers(t *testing.T) {
+	pr := oauthrs.ProtectedResource{
+		Resource: "https://notes.example/api", AuthorizationServers: []string{"https://auth.example/p/acme"},
+		Extra: map[string]any{"cli_client_id": "cli123", "resource": "https://evil.example/api"},
+	}
+	w := httptest.NewRecorder()
+	oauthrs.MetadataHandler(pr).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+	got, err := oauthrs.ParseProtectedResource(w.Body.Bytes())
+	require.NoError(t, err)
+	assert.Equal(t, "https://notes.example/api", got.Resource, "RFC 9728 §2: an extra member never overrides a standard one")
+	assert.Equal(t, map[string]any{"cli_client_id": "cli123"}, got.Extra, "RFC 9728 §2: further parameters round-trip")
 }
