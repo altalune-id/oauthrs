@@ -15,4 +15,4 @@ h := oauthrs.Middleware(v, metadata)(oauthrs.RequireScope(metadata, "notes:read"
 
 Handlers read the verified token with `oauthrs.FromContext`. See `example_test.go`.
 
-Dependencies: the standard library, go-jose and `github.com/altalune-id/oidcrp`. Licensed under Apache-2.0 (see `LICENSE` and `NOTICE`).
+Dependencies: the standard library, golang.org/x/sync and go-jose, and `github.com/altalune-id/oidcrp`. Licensed under Apache-2.0 (see `LICENSE` and `NOTICE`).

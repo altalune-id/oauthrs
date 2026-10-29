@@ -43,7 +43,7 @@ type Token struct {
 	JWTID     string
 	SessionID string
 	ExpiresAt time.Time
-	// Personal reports an opaque token accepted through introspection, such as a personal token; it names no client.
+	// Personal reports an opaque token accepted through introspection, such as a personal token; ClientID is its client_id, if any.
 	Personal bool
 }
 
