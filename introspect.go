@@ -26,6 +26,8 @@ const (
 type Introspection struct {
 	ClientID     string
 	ClientSecret string
+	// TokenPrefix is the issuer's opaque-token prefix, such as Othra's "othra_pt_"; only tokens that start with it are introspected.
+	TokenPrefix string
 	// CacheTTL bounds how long an active answer is reused, never past the token's exp: 0 means 30 s, at most 60 s, negative turns it off.
 	// Inactive answers are never cached.
 	CacheTTL time.Duration

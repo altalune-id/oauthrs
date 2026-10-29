@@ -13,7 +13,7 @@ import (
 
 func withIntrospection(ttl time.Duration) func(*oauthrs.Config) {
 	return func(c *oauthrs.Config) {
-		c.Introspection = &oauthrs.Introspection{ClientID: "notes-rs", ClientSecret: "s3cret", CacheTTL: ttl}
+		c.Introspection = &oauthrs.Introspection{ClientID: "notes-rs", ClientSecret: "s3cret", TokenPrefix: "othra_pt_", CacheTTL: ttl}
 	}
 }
 
@@ -54,7 +54,7 @@ func TestVerify_IntrospectionChecks(t *testing.T) {
 	}
 
 	wrong := newVerifier(t, idp, func(c *oauthrs.Config) {
-		c.Introspection = &oauthrs.Introspection{ClientID: "notes-rs", ClientSecret: "wrong"}
+		c.Introspection = &oauthrs.Introspection{ClientID: "notes-rs", ClientSecret: "wrong", TokenPrefix: "othra_pt_"}
 	})
 	_, err := wrong.Verify(context.Background(), "othra_pt_other_aud")
 	require.Error(t, err)
@@ -103,4 +103,22 @@ func TestVerify_IntrospectionCacheOff(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.Equal(t, 2, idp.Introspections(), "a negative CacheTTL asks every time, so a revoke shows at once")
+}
+
+func TestVerify_IntrospectsOnlyPrefixedTokens(t *testing.T) {
+	idp := newIDP(t)
+	idp.Introspector("notes-rs", "s3cret")
+	v := newVerifier(t, idp, withIntrospection(time.Minute))
+	for _, raw := range []string{"notes_ak_live_key", "othra_ptx", "OTHRA_PT_upper"} {
+		_, err := v.Verify(context.Background(), raw)
+		assert.True(t, oauthrs.IsInvalidTokenError(err), raw)
+	}
+	assert.Zero(t, idp.Introspections(), "an app's own opaque credential never reaches the issuer")
+}
+
+func TestNew_IntrospectionNeedsTokenPrefix(t *testing.T) {
+	_, err := oauthrs.New(oauthrs.Config{
+		Issuer: "https://auth.example", Audience: audience, Introspection: &oauthrs.Introspection{ClientID: "notes-rs", ClientSecret: "s3cret"},
+	})
+	require.Error(t, err)
 }
