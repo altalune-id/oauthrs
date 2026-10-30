@@ -64,6 +64,7 @@ func TestParseProtectedResource(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, pr.Resource, "only the exact RFC 9728 keys count, never a case-folded match")
 	assert.Empty(t, pr.AuthorizationServers, "only the exact RFC 9728 keys count, never a case-folded match")
+	assert.Equal(t, "https://evil.example", pr.Extra["Resource"], "a case-folded key is only an extra member")
 
 	for _, bad := range []string{`[]`, `"x"`, `{"resource":1}`, `{"authorization_servers":"x"}`, `not json`} {
 		_, err := oauthrs.ParseProtectedResource([]byte(bad))
@@ -83,4 +84,11 @@ func TestMetadataExtraMembers(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "https://notes.example/api", got.Resource, "RFC 9728 §2: an extra member never overrides a standard one")
 	assert.Equal(t, map[string]any{"cli_client_id": "cli123"}, got.Extra, "RFC 9728 §2: further parameters round-trip")
+}
+
+func TestMetadataHandlerUnmarshallableExtra(t *testing.T) {
+	h := oauthrs.MetadataHandler(oauthrs.ProtectedResource{Resource: "https://notes.example/api", Extra: map[string]any{"x": func() {}}})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

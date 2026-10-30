@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 )
 
@@ -24,7 +23,11 @@ type ProtectedResource struct {
 }
 
 func isStandardMember(key string) bool {
-	return slices.Contains([]string{"resource", "authorization_servers", "scopes_supported", "bearer_methods_supported"}, key)
+	switch key {
+	case "resource", "authorization_servers", "scopes_supported", "bearer_methods_supported":
+		return true
+	}
+	return false
 }
 
 // MetadataURL is where the RFC 9728 §3.1 metadata of resource lives: the well-known path between its host and its path, its query kept.
@@ -92,24 +95,28 @@ func ParseProtectedResource(body []byte) (ProtectedResource, error) {
 		return ProtectedResource{}, errors.New("oauthrs: the metadata is not a JSON object")
 	}
 	var pr ProtectedResource
-	for key, dst := range map[string]any{
-		"resource": &pr.Resource, "authorization_servers": &pr.AuthorizationServers, "scopes_supported": &pr.ScopesSupported,
-		"bearer_methods_supported": &pr.BearerMethodsSupported,
-	} {
-		if raw, found := doc[key]; found && json.Unmarshal(raw, dst) != nil {
-			return ProtectedResource{}, errors.New("oauthrs: the metadata field " + key + " has the wrong type")
-		}
-	}
 	for key, raw := range doc {
-		if isStandardMember(key) {
-			continue
-		}
-		var v any
-		if json.Unmarshal(raw, &v) == nil {
+		var dst any
+		switch key {
+		case "resource":
+			dst = &pr.Resource
+		case "authorization_servers":
+			dst = &pr.AuthorizationServers
+		case "scopes_supported":
+			dst = &pr.ScopesSupported
+		case "bearer_methods_supported":
+			dst = &pr.BearerMethodsSupported
+		default:
+			var v any
+			_ = json.Unmarshal(raw, &v)
 			if pr.Extra == nil {
 				pr.Extra = map[string]any{}
 			}
 			pr.Extra[key] = v
+			continue
+		}
+		if json.Unmarshal(raw, dst) != nil {
+			return ProtectedResource{}, errors.New("oauthrs: the metadata field " + key + " has the wrong type")
 		}
 	}
 	return pr, nil
