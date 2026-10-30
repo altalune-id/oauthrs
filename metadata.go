@@ -18,6 +18,16 @@ type ProtectedResource struct {
 	AuthorizationServers   []string `json:"authorization_servers,omitempty"`
 	ScopesSupported        []string `json:"scopes_supported,omitempty"`
 	BearerMethodsSupported []string `json:"bearer_methods_supported,omitempty"`
+	// Extra holds further metadata parameters (RFC 9728 §2), such as an app's public CLI client id; it never overrides the ones above.
+	Extra map[string]any `json:"-"`
+}
+
+func isStandardMember(key string) bool {
+	switch key {
+	case "resource", "authorization_servers", "scopes_supported", "bearer_methods_supported":
+		return true
+	}
+	return false
 }
 
 // MetadataURL is where the RFC 9728 §3.1 metadata of resource lives: the well-known path between its host and its path, its query kept.
@@ -43,7 +53,7 @@ func MetadataHandler(pr ProtectedResource) http.Handler {
 	if len(pr.BearerMethodsSupported) == 0 {
 		pr.BearerMethodsSupported = []string{"header"}
 	}
-	body, err := json.Marshal(pr)
+	body, err := marshalMetadata(pr)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method != http.MethodGet && r.Method != http.MethodHead:
@@ -61,6 +71,23 @@ func MetadataHandler(pr ProtectedResource) http.Handler {
 	})
 }
 
+func marshalMetadata(pr ProtectedResource) ([]byte, error) {
+	base, err := json.Marshal(pr)
+	if err != nil || len(pr.Extra) == 0 {
+		return base, err
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(base, &doc); err != nil {
+		return nil, err
+	}
+	for k, v := range pr.Extra {
+		if !isStandardMember(k) {
+			doc[k] = v
+		}
+	}
+	return json.Marshal(doc)
+}
+
 // ParseProtectedResource reads an RFC 9728 document. NOTE: only the exact keys count, as encoding/json would match "Resource" to resource.
 func ParseProtectedResource(body []byte) (ProtectedResource, error) {
 	var doc map[string]json.RawMessage
@@ -68,11 +95,27 @@ func ParseProtectedResource(body []byte) (ProtectedResource, error) {
 		return ProtectedResource{}, errors.New("oauthrs: the metadata is not a JSON object")
 	}
 	var pr ProtectedResource
-	for key, dst := range map[string]any{
-		"resource": &pr.Resource, "authorization_servers": &pr.AuthorizationServers, "scopes_supported": &pr.ScopesSupported,
-		"bearer_methods_supported": &pr.BearerMethodsSupported,
-	} {
-		if raw, found := doc[key]; found && json.Unmarshal(raw, dst) != nil {
+	for key, raw := range doc {
+		var dst any
+		switch key {
+		case "resource":
+			dst = &pr.Resource
+		case "authorization_servers":
+			dst = &pr.AuthorizationServers
+		case "scopes_supported":
+			dst = &pr.ScopesSupported
+		case "bearer_methods_supported":
+			dst = &pr.BearerMethodsSupported
+		default:
+			var v any
+			_ = json.Unmarshal(raw, &v)
+			if pr.Extra == nil {
+				pr.Extra = map[string]any{}
+			}
+			pr.Extra[key] = v
+			continue
+		}
+		if json.Unmarshal(raw, dst) != nil {
 			return ProtectedResource{}, errors.New("oauthrs: the metadata field " + key + " has the wrong type")
 		}
 	}
