@@ -1,6 +1,7 @@
 package oauthrs
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -18,9 +19,14 @@ import (
 const (
 	defaultIntrospectionTTL = 30 * time.Second
 	maxIntrospectionTTL     = time.Minute
+	refusedTTL              = 30 * time.Second
+	defaultIntrospectionTO  = 10 * time.Second
 	maxCachedTokens         = 10_000
 	maxResponseBytes        = 1 << 20
 )
+
+// ErrIntrospectionBudget signals that Introspection.MaxPerMinute is spent; it is the server's limit, never the caller's token.
+var ErrIntrospectionBudget = errors.New("oauthrs: introspection budget exhausted")
 
 // Introspection is this resource server's registration at the issuer's RFC 7662 introspection endpoint.
 type Introspection struct {
@@ -29,8 +35,13 @@ type Introspection struct {
 	// TokenPrefix is the issuer's opaque-token prefix, such as Othra's "othra_pt_"; only tokens that start with it are introspected.
 	TokenPrefix string
 	// CacheTTL bounds how long an active answer is reused, never past the token's exp: 0 means 30 s, at most 60 s, negative turns it off.
-	// Inactive answers are never cached.
+	// A refused answer, such as inactive, is reused for 30 s whatever CacheTTL says, since a refused token never turns active.
 	CacheTTL time.Duration
+	// Precheck, when set, refuses a prefixed token locally, with no introspection call, unless it has the issuer's token format.
+	// For Othra: the prefix, 43 base62 characters, then a 6-character base62 CRC32 checksum of them.
+	Precheck func(token string) bool
+	// MaxPerMinute, when positive, caps introspection calls for all tokens together; pair it with per-client rate limiting.
+	MaxPerMinute int
 }
 
 type introspectionAnswer struct {
@@ -43,32 +54,43 @@ type introspectionAnswer struct {
 	ExpiresAt int64    `json:"exp"`
 }
 
-// SECURITY: RFC 7662 §4: an answer counts only when active and it names this issuer, this resource and a live subject.
+// NOTE: concurrent calls for one token share one introspection, which outlives a caller that gives up.
 func (v *Verifier) introspect(ctx context.Context, raw string) (*Token, error) {
 	sum := sha256.Sum256([]byte(raw))
 	now := v.now()
 	if tok, ok := v.cache.get(sum, now); ok {
 		return tok, nil
 	}
+	if _, ok := v.refused.get(sum, now); ok {
+		return nil, invalid("introspection refused it recently")
+	}
+	ch := v.flights.DoChan(string(sum[:]), func() (any, error) {
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cmp.Or(v.keys.HTTPClient().Timeout, defaultIntrospectionTO))
+		defer cancel()
+		return v.introspectOnce(fctx, sum, raw)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("oauthrs: introspection: %w", ctx.Err())
+	case r := <-ch:
+		tok, _ := r.Val.(*Token)
+		return tok, r.Err
+	}
+}
+
+func (v *Verifier) introspectOnce(ctx context.Context, sum [sha256.Size]byte, raw string) (*Token, error) {
+	if !v.budget.take(v.now()) {
+		return nil, ErrIntrospectionBudget
+	}
 	ans, err := v.askIntrospection(ctx, raw)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case !ans.Active:
-		return nil, invalid("introspection says inactive")
-	case ans.Issuer != "" && ans.Issuer != v.cfg.Issuer:
-		return nil, invalid("introspection names another issuer")
-	case !slices.Contains(ans.Audience, v.cfg.Audience):
-		return nil, invalid("introspection names another resource")
-	case ans.Subject == "":
-		return nil, invalid("introspection names no subject")
-	case ans.ExpiresAt == 0 || !now.Before(time.Unix(ans.ExpiresAt, 0)):
-		return nil, &InvalidTokenError{Reason: "expired", Err: &ExpiredTokenError{}}
-	}
-	tok := &Token{
-		Issuer: v.cfg.Issuer, Subject: ans.Subject, ClientID: ans.ClientID, Scopes: strings.Fields(ans.Scope),
-		ExpiresAt: time.Unix(ans.ExpiresAt, 0), Personal: true,
+	now := v.now()
+	tok, err := v.accept(ans, now)
+	if err != nil {
+		v.refused.put(sum, nil, now.Add(refusedTTL))
+		return nil, err
 	}
 	ttl := v.cfg.Introspection.CacheTTL
 	switch {
@@ -85,6 +107,26 @@ func (v *Verifier) introspect(ctx context.Context, raw string) (*Token, error) {
 	}
 	v.cache.put(sum, tok, until)
 	return tok, nil
+}
+
+// SECURITY: RFC 7662 §4: an answer counts only when active and it names this issuer, this resource and a live subject.
+func (v *Verifier) accept(ans *introspectionAnswer, now time.Time) (*Token, error) {
+	switch {
+	case !ans.Active:
+		return nil, invalid("introspection says inactive")
+	case ans.Issuer != "" && ans.Issuer != v.cfg.Issuer:
+		return nil, invalid("introspection names another issuer")
+	case !slices.Contains(ans.Audience, v.cfg.Audience):
+		return nil, invalid("introspection names another resource")
+	case ans.Subject == "":
+		return nil, invalid("introspection names no subject")
+	case ans.ExpiresAt == 0 || !now.Before(time.Unix(ans.ExpiresAt, 0)):
+		return nil, &InvalidTokenError{Reason: "expired", Err: &ExpiredTokenError{}}
+	}
+	return &Token{
+		Issuer: v.cfg.Issuer, Subject: ans.Subject, ClientID: ans.ClientID, Scopes: strings.Fields(ans.Scope),
+		ExpiresAt: time.Unix(ans.ExpiresAt, 0), Personal: true,
+	}, nil
 }
 
 func (v *Verifier) askIntrospection(ctx context.Context, raw string) (*introspectionAnswer, error) {
@@ -127,7 +169,7 @@ type cachedToken struct {
 	until time.Time
 }
 
-// NOTE: positive answers only, keyed by the token's hash, bounded in size; a full cache drops expired entries or skips caching.
+// NOTE: keyed by the token's hash and bounded in size; a full cache evicts one entry.
 type introspectionCache struct {
 	mu      sync.Mutex
 	entries map[[sha256.Size]byte]cachedToken
@@ -158,4 +200,35 @@ func (c *introspectionCache) put(key [sha256.Size]byte, tok *Token, until time.T
 		}
 	}
 	c.entries[key] = cachedToken{tok: tok, until: until}
+}
+
+type budget struct {
+	rate float64
+
+	mu     sync.Mutex
+	tokens float64
+	last   time.Time
+}
+
+func newBudget(perMinute int) *budget {
+	return &budget{rate: float64(max(perMinute, 0)), tokens: float64(max(perMinute, 0))}
+}
+
+func (b *budget) take(now time.Time) bool {
+	if b.rate == 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if now.After(b.last) && !b.last.IsZero() {
+		b.tokens = min(b.rate, b.tokens+b.rate*now.Sub(b.last).Minutes())
+	}
+	if now.After(b.last) {
+		b.last = now
+	}
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
 }

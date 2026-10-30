@@ -12,6 +12,7 @@ import (
 
 	"github.com/altalune-id/oidcrp"
 	"github.com/go-jose/go-jose/v4"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -52,10 +53,13 @@ func (t *Token) HasScope(scope string) bool { return slices.Contains(t.Scopes, s
 
 // Verifier checks the bearer tokens of one resource server; safe for concurrent use.
 type Verifier struct {
-	cfg   Config
-	keys  *oidcrp.KeySource
-	now   func() time.Time
-	cache *introspectionCache
+	cfg     Config
+	keys    *oidcrp.KeySource
+	now     func() time.Time
+	cache   *introspectionCache
+	refused *introspectionCache
+	flights singleflight.Group
+	budget  *budget
 }
 
 // New builds a Verifier; Issuer and Audience are required.
@@ -67,6 +71,8 @@ func New(cfg Config) (*Verifier, error) {
 		return nil, errors.New("oauthrs: an audience is required")
 	case cfg.Introspection != nil && cfg.Introspection.TokenPrefix == "":
 		return nil, errors.New("oauthrs: introspection needs a token prefix")
+	case cfg.Keys != nil && cfg.Keys.Issuer() != cfg.Issuer:
+		return nil, errors.New("oauthrs: the key source reads another issuer")
 	}
 	if cfg.ClockSkew <= 0 {
 		cfg.ClockSkew = defaultClockSkew
@@ -75,7 +81,13 @@ func New(cfg Config) (*Verifier, error) {
 	if keys == nil {
 		keys = oidcrp.NewKeySource(cfg.Issuer, cfg.HTTPClient)
 	}
-	return &Verifier{cfg: cfg, keys: keys, now: time.Now, cache: newIntrospectionCache()}, nil
+	perMinute := 0
+	if cfg.Introspection != nil {
+		perMinute = cfg.Introspection.MaxPerMinute
+	}
+	return &Verifier{
+		cfg: cfg, keys: keys, now: time.Now, cache: newIntrospectionCache(), refused: newIntrospectionCache(), budget: newBudget(perMinute),
+	}, nil
 }
 
 // WithClock replaces the clock, for tests.
@@ -99,6 +111,8 @@ func (v *Verifier) Verify(ctx context.Context, bearer string) (*Token, error) {
 	// SECURITY: an opaque token without the issuer's prefix is the app's own credential, such as an API key, and never leaves the app.
 	case !strings.HasPrefix(bearer, v.cfg.Introspection.TokenPrefix):
 		return nil, invalid("opaque token without the issuer's prefix")
+	case v.cfg.Introspection.Precheck != nil && !v.cfg.Introspection.Precheck(bearer):
+		return nil, invalid("opaque token not in the issuer's format")
 	}
 	return v.introspect(ctx, bearer)
 }
