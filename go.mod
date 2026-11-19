@@ -1,6 +1,6 @@
 module github.com/altalune-id/oauthrs
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/altalune-id/oidcrp v0.0.0-20261030070618-63bfc891ff35
